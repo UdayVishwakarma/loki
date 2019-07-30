@@ -18,20 +18,28 @@ $ helm repo update
 
 ## Deploy Loki and Promtail to your cluster
 
+### Deploy with default config
+
 ```bash
 $ helm upgrade --install loki loki/loki-stack
+```
+
+### Deploy with custom config
+
+```bash
+$ helm upgrade --install loki loki/loki-stack --set "key1=val1,key2=val2,..."
 ```
 
 ## Deploy Loki only
 
 ```bash
-$ helm upgrade --install loki loki/loki --set "loki.serviceName=my-loki"
+$ helm upgrade --install loki loki/loki
 ```
 
 ## Deploy Promtail only
 
 ```bash
-$ helm upgrade --install promtail loki/promtail
+$ helm upgrade --install promtail loki/promtail --set "loki.serviceName=loki"
 ```
 
 ## Deploy Grafana to your cluster
@@ -56,3 +64,58 @@ $ kubectl port-forward --namespace <YOUR-NAMESPACE> service/loki-grafana 3000:80
 
 Navigate to http://localhost:3000 and login with `admin` and the password output above.
 Then follow the [instructions for adding the loki datasource](/docs/usage.md), using the URL `http://loki:3100/`.
+
+## Run Loki behind https ingress
+
+If Loki and Promtail are deployed on different clusters you can add an Ingress in front of Loki.
+By adding a certificate you create an https endpoint. For extra security enable basic authentication on the Ingress.
+
+In promtail set the following values to communicate with https and basic auth
+
+```
+loki:
+  serviceScheme: https
+  user: user
+  password: pass
+```
+
+Sample helm template for ingress:
+```
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+annotations:
+    kubernetes.io/ingress.class: {{ .Values.ingress.class }}
+    ingress.kubernetes.io/auth-type: "basic"
+    ingress.kubernetes.io/auth-secret: {{ .Values.ingress.basic.secret }}
+name: loki
+spec:
+rules:
+- host: {{ .Values.ingress.host }}
+    http:
+    paths:
+    - backend:
+        serviceName: loki
+        servicePort: 3100
+tls:
+- secretName: {{ .Values.ingress.cert }}
+    hosts:
+    - {{ .Values.ingress.host }}
+```
+
+## How to contribute
+
+After adding your new feature to the appropriate chart, you can build and deploy it locally to test:
+
+```bash
+$ make helm
+$ helm upgrade --install loki ./loki-stack-*.tgz
+```
+
+After verifying your changes, you need to bump the chart version following [semantic versioning](https://semver.org) rules.
+For example, if you update the loki chart, you need to bump the versions as follows:
+
+- Update version loki/Chart.yaml
+- Update version loki-stack/Chart.yaml
+
+You can use the `make helm-debug` to test and print out all chart templates. If you want to install helm (tiller) in your cluster use `make helm-install`, to install the current build in your Kubernetes cluster run `make helm-upgrade`.

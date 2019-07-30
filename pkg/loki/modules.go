@@ -3,12 +3,17 @@ package loki
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
+	"github.com/go-kit/kit/log/level"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
+	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/storage"
 	"github.com/cortexproject/cortex/pkg/ring"
+	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/server"
@@ -17,7 +22,10 @@ import (
 	"github.com/grafana/loki/pkg/ingester"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/querier"
+	loki_storage "github.com/grafana/loki/pkg/storage"
 )
+
+const maxChunkAgeForTableManager = 12 * time.Hour
 
 type moduleName int
 
@@ -30,6 +38,7 @@ const (
 	Ingester
 	Querier
 	Store
+	TableManager
 	All
 )
 
@@ -49,6 +58,8 @@ func (m moduleName) String() string {
 		return "ingester"
 	case Querier:
 		return "querier"
+	case TableManager:
+		return "table-manager"
 	case All:
 		return "all"
 	default:
@@ -79,6 +90,9 @@ func (m *moduleName) Set(s string) error {
 	case "querier":
 		*m = Querier
 		return nil
+	case "table-manager":
+		*m = TableManager
+		return nil
 	case "all":
 		*m = All
 		return nil
@@ -93,7 +107,7 @@ func (t *Loki) initServer() (err error) {
 }
 
 func (t *Loki) initRing() (err error) {
-	t.ring, err = ring.New(t.cfg.Ingester.LifecyclerConfig.RingConfig)
+	t.ring, err = ring.New(t.cfg.Ingester.LifecyclerConfig.RingConfig, "ingester")
 	if err != nil {
 		return
 	}
@@ -137,13 +151,14 @@ func (t *Loki) initQuerier() (err error) {
 
 func (t *Loki) initIngester() (err error) {
 	t.cfg.Ingester.LifecyclerConfig.ListenPort = &t.cfg.Server.GRPCListenPort
-	t.ingester, err = ingester.New(t.cfg.Ingester, t.store)
+	t.ingester, err = ingester.New(t.cfg.Ingester, t.cfg.IngesterClient, t.store)
 	if err != nil {
 		return
 	}
 
 	logproto.RegisterPusherServer(t.server.GRPC, t.ingester)
 	logproto.RegisterQuerierServer(t.server.GRPC, t.ingester)
+	logproto.RegisterIngesterServer(t.server.GRPC, t.ingester)
 	grpc_health_v1.RegisterHealthServer(t.server.GRPC, t.ingester)
 	t.server.HTTP.Path("/ready").Handler(http.HandlerFunc(t.ingester.ReadinessHandler))
 	t.server.HTTP.Path("/flush").Handler(http.HandlerFunc(t.ingester.FlushHandler))
@@ -155,8 +170,57 @@ func (t *Loki) stopIngester() error {
 	return nil
 }
 
+func (t *Loki) stoppingIngester() error {
+	t.ingester.Stopping()
+	return nil
+}
+
+func (t *Loki) initTableManager() error {
+	err := t.cfg.SchemaConfig.Load()
+	if err != nil {
+		return err
+	}
+
+	// Assume the newest config is the one to use
+	lastConfig := &t.cfg.SchemaConfig.Configs[len(t.cfg.SchemaConfig.Configs)-1]
+
+	if (t.cfg.TableManager.ChunkTables.WriteScale.Enabled ||
+		t.cfg.TableManager.IndexTables.WriteScale.Enabled ||
+		t.cfg.TableManager.ChunkTables.InactiveWriteScale.Enabled ||
+		t.cfg.TableManager.IndexTables.InactiveWriteScale.Enabled ||
+		t.cfg.TableManager.ChunkTables.ReadScale.Enabled ||
+		t.cfg.TableManager.IndexTables.ReadScale.Enabled ||
+		t.cfg.TableManager.ChunkTables.InactiveReadScale.Enabled ||
+		t.cfg.TableManager.IndexTables.InactiveReadScale.Enabled) &&
+		(t.cfg.StorageConfig.AWSStorageConfig.ApplicationAutoScaling.URL == nil && t.cfg.StorageConfig.AWSStorageConfig.Metrics.URL == "") {
+		level.Error(util.Logger).Log("msg", "WriteScale is enabled but no ApplicationAutoScaling or Metrics URL has been provided")
+		os.Exit(1)
+	}
+
+	tableClient, err := storage.NewTableClient(lastConfig.IndexType, t.cfg.StorageConfig)
+	if err != nil {
+		return err
+	}
+
+	bucketClient, err := storage.NewBucketClient(t.cfg.StorageConfig)
+	util.CheckFatal("initializing bucket client", err)
+
+	t.tableManager, err = chunk.NewTableManager(t.cfg.TableManager, t.cfg.SchemaConfig, maxChunkAgeForTableManager, tableClient, bucketClient)
+	if err != nil {
+		return err
+	}
+
+	t.tableManager.Start()
+	return nil
+}
+
+func (t *Loki) stopTableManager() error {
+	t.tableManager.Stop()
+	return nil
+}
+
 func (t *Loki) initStore() (err error) {
-	t.store, err = storage.NewStore(t.cfg.StorageConfig, t.cfg.ChunkStoreConfig, t.cfg.SchemaConfig, t.overrides)
+	t.store, err = loki_storage.NewStore(t.cfg.StorageConfig, t.cfg.ChunkStoreConfig, t.cfg.SchemaConfig, t.overrides)
 	return
 }
 
@@ -176,45 +240,58 @@ func listDeps(m moduleName) []moduleName {
 
 // orderedDeps gets a list of all dependencies ordered so that items are always after any of their dependencies.
 func orderedDeps(m moduleName) []moduleName {
-	deps := listDeps(m)
+	// get a unique list of dependencies and init a map to keep whether they have been added to our result
+	deps := uniqueDeps(listDeps(m))
+	added := map[moduleName]bool{}
 
-	// get a unique list of moduleNames, with a flag for whether they have been added to our result
-	uniq := map[moduleName]bool{}
-	for _, dep := range deps {
-		uniq[dep] = false
-	}
-
-	result := make([]moduleName, 0, len(uniq))
+	result := make([]moduleName, 0, len(deps))
 
 	// keep looping through all modules until they have all been added to the result.
-
-	for len(result) < len(uniq) {
+	for len(result) < len(deps) {
 	OUTER:
-		for name, added := range uniq {
-			if added {
+		for _, name := range deps {
+			if added[name] {
 				continue
 			}
+
 			for _, dep := range modules[name].deps {
 				// stop processing this module if one of its dependencies has
 				// not been added to the result yet.
-				if !uniq[dep] {
+				if !added[dep] {
 					continue OUTER
 				}
 			}
 
 			// if all of the module's dependencies have been added to the result slice,
 			// then we can safely add this module to the result slice as well.
-			uniq[name] = true
+			added[name] = true
 			result = append(result, name)
 		}
 	}
+
+	return result
+}
+
+// uniqueDeps returns the unique list of input dependencies, guaranteeing input order stability
+func uniqueDeps(deps []moduleName) []moduleName {
+	result := make([]moduleName, 0, len(deps))
+	uniq := map[moduleName]bool{}
+
+	for _, dep := range deps {
+		if !uniq[dep] {
+			result = append(result, dep)
+			uniq[dep] = true
+		}
+	}
+
 	return result
 }
 
 type module struct {
-	deps []moduleName
-	init func(t *Loki) error
-	stop func(t *Loki) error
+	deps     []moduleName
+	init     func(t *Loki) error
+	stopping func(t *Loki) error
+	stop     func(t *Loki) error
 }
 
 var modules = map[moduleName]module{
@@ -243,9 +320,10 @@ var modules = map[moduleName]module{
 	},
 
 	Ingester: {
-		deps: []moduleName{Store, Server},
-		init: (*Loki).initIngester,
-		stop: (*Loki).stopIngester,
+		deps:     []moduleName{Store, Server},
+		init:     (*Loki).initIngester,
+		stop:     (*Loki).stopIngester,
+		stopping: (*Loki).stoppingIngester,
 	},
 
 	Querier: {
@@ -253,7 +331,13 @@ var modules = map[moduleName]module{
 		init: (*Loki).initQuerier,
 	},
 
+	TableManager: {
+		deps: []moduleName{Server},
+		init: (*Loki).initTableManager,
+		stop: (*Loki).stopTableManager,
+	},
+
 	All: {
-		deps: []moduleName{Querier, Ingester, Distributor},
+		deps: []moduleName{Querier, Ingester, Distributor, TableManager},
 	},
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/grafana/loki/pkg/ingester"
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/querier"
+	loki_storage "github.com/grafana/loki/pkg/storage"
 )
 
 // Config is the root config for Loki.
@@ -27,15 +28,16 @@ type Config struct {
 	Target      moduleName `yaml:"target,omitempty"`
 	AuthEnabled bool       `yaml:"auth_enabled,omitempty"`
 
-	Server           server.Config      `yaml:"server,omitempty"`
-	Distributor      distributor.Config `yaml:"distributor,omitempty"`
-	Querier          querier.Config     `yaml:"querier,omitempty"`
-	IngesterClient   client.Config      `yaml:"ingester_client,omitempty"`
-	Ingester         ingester.Config    `yaml:"ingester,omitempty"`
-	StorageConfig    storage.Config     `yaml:"storage_config,omitempty"`
-	ChunkStoreConfig chunk.StoreConfig  `yaml:"chunk_store_config,omitempty"`
-	SchemaConfig     chunk.SchemaConfig `yaml:"schema_config,omitempty"`
-	LimitsConfig     validation.Limits  `yaml:"limits_config,omitempty"`
+	Server           server.Config            `yaml:"server,omitempty"`
+	Distributor      distributor.Config       `yaml:"distributor,omitempty"`
+	Querier          querier.Config           `yaml:"querier,omitempty"`
+	IngesterClient   client.Config            `yaml:"ingester_client,omitempty"`
+	Ingester         ingester.Config          `yaml:"ingester,omitempty"`
+	StorageConfig    storage.Config           `yaml:"storage_config,omitempty"`
+	ChunkStoreConfig chunk.StoreConfig        `yaml:"chunk_store_config,omitempty"`
+	SchemaConfig     chunk.SchemaConfig       `yaml:"schema_config,omitempty"`
+	LimitsConfig     validation.Limits        `yaml:"limits_config,omitempty"`
+	TableManager     chunk.TableManagerConfig `yaml:"table_manager,omitempty"`
 }
 
 // RegisterFlags registers flag.
@@ -55,19 +57,21 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.ChunkStoreConfig.RegisterFlags(f)
 	c.SchemaConfig.RegisterFlags(f)
 	c.LimitsConfig.RegisterFlags(f)
+	c.TableManager.RegisterFlags(f)
 }
 
 // Loki is the root datastructure for Loki.
 type Loki struct {
 	cfg Config
 
-	server      *server.Server
-	ring        *ring.Ring
-	overrides   *validation.Overrides
-	distributor *distributor.Distributor
-	ingester    *ingester.Ingester
-	querier     *querier.Querier
-	store       chunk.Store
+	server       *server.Server
+	ring         *ring.Ring
+	overrides    *validation.Overrides
+	distributor  *distributor.Distributor
+	ingester     *ingester.Ingester
+	querier      *querier.Querier
+	store        loki_storage.Store
+	tableManager *chunk.TableManager
 
 	httpAuthMiddleware middleware.Interface
 }
@@ -135,6 +139,7 @@ func (t *Loki) Run() error {
 
 // Stop gracefully stops a Loki.
 func (t *Loki) Stop() error {
+	t.stopping(t.cfg.Target)
 	t.server.Shutdown()
 	t.stop(t.cfg.Target)
 	return nil
@@ -153,6 +158,24 @@ func (t *Loki) stopModule(m moduleName) {
 	level.Info(util.Logger).Log("msg", "stopping", "module", m)
 	if modules[m].stop != nil {
 		if err := modules[m].stop(t); err != nil {
+			level.Error(util.Logger).Log("msg", "error stopping", "module", m, "err", err)
+		}
+	}
+}
+
+func (t *Loki) stopping(m moduleName) {
+	t.stoppingModule(m)
+	deps := orderedDeps(m)
+	// iterate over our deps in reverse order and call stoppingModule
+	for i := len(deps) - 1; i >= 0; i-- {
+		t.stoppingModule(deps[i])
+	}
+}
+
+func (t *Loki) stoppingModule(m moduleName) {
+	level.Info(util.Logger).Log("msg", "notifying module about stopping", "module", m)
+	if modules[m].stopping != nil {
+		if err := modules[m].stopping(t); err != nil {
 			level.Error(util.Logger).Log("msg", "error stopping", "module", m, "err", err)
 		}
 	}

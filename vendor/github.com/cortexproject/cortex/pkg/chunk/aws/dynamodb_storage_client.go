@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-kit/kit/log/level"
 	ot "github.com/opentracing/opentracing-go"
-	otlog "github.com/opentracing/opentracing-go/log"
+	"golang.org/x/time/rate"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -25,6 +25,7 @@ import (
 	chunk_util "github.com/cortexproject/cortex/pkg/chunk/util"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	awscommon "github.com/weaveworks/common/aws"
 	"github.com/weaveworks/common/instrument"
 	"github.com/weaveworks/common/user"
@@ -61,6 +62,11 @@ var (
 		Name:      "dynamo_consumed_capacity_total",
 		Help:      "The capacity units consumed by operation.",
 	}, []string{"operation", tableNameLabel})
+	dynamoThrottled = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "dynamo_throttled_total",
+		Help:      "The total number of throttled events.",
+	}, []string{"operation", tableNameLabel})
 	dynamoFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "cortex",
 		Name:      "dynamo_failures_total",
@@ -79,20 +85,14 @@ var (
 		// metric names.
 		Buckets: prometheus.ExponentialBuckets(1, 4, 6),
 	})
-	dynamoQueryRetryCount = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "cortex",
-		Name:      "dynamo_query_retry_count",
-		Help:      "Number of retries per DynamoDB operation.",
-		Buckets:   prometheus.LinearBuckets(0, 1, 21),
-	}, []string{"operation"})
 )
 
 func init() {
 	dynamoRequestDuration.Register()
 	prometheus.MustRegister(dynamoConsumedCapacity)
+	prometheus.MustRegister(dynamoThrottled)
 	prometheus.MustRegister(dynamoFailures)
 	prometheus.MustRegister(dynamoQueryPagesCount)
-	prometheus.MustRegister(dynamoQueryRetryCount)
 	prometheus.MustRegister(dynamoDroppedRequests)
 }
 
@@ -100,6 +100,7 @@ func init() {
 type DynamoDBConfig struct {
 	DynamoDB               flagext.URLValue
 	APILimit               float64
+	ThrottleLimit          float64
 	ApplicationAutoScaling flagext.URLValue
 	Metrics                MetricsAutoScalingConfig
 	ChunkGangSize          int
@@ -112,6 +113,7 @@ func (cfg *DynamoDBConfig) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&cfg.DynamoDB, "dynamodb.url", "DynamoDB endpoint URL with escaped Key and Secret encoded. "+
 		"If only region is specified as a host, proper endpoint will be deduced. Use inmemory:///<table-name> to use a mock in-memory implementation.")
 	f.Float64Var(&cfg.APILimit, "dynamodb.api-limit", 2.0, "DynamoDB table management requests per second limit.")
+	f.Float64Var(&cfg.ThrottleLimit, "dynamodb.throttle-limit", 10.0, "DynamoDB rate cap to back off when throttled.")
 	f.Var(&cfg.ApplicationAutoScaling, "applicationautoscaling.url", "ApplicationAutoscaling endpoint URL with escaped Key and Secret encoded.")
 	f.IntVar(&cfg.ChunkGangSize, "dynamodb.chunk.gang.size", 10, "Number of chunks to group together to parallelise fetches (zero to disable)")
 	f.IntVar(&cfg.ChunkGetMaxParallelism, "dynamodb.chunk.get.max.parallelism", 32, "Max number of chunk-get operations to start in parallel")
@@ -124,7 +126,8 @@ func (cfg *DynamoDBConfig) RegisterFlags(f *flag.FlagSet) {
 // StorageConfig specifies config for storing data on AWS.
 type StorageConfig struct {
 	DynamoDBConfig
-	S3 flagext.URLValue
+	S3               flagext.URLValue
+	S3ForcePathStyle bool
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -133,6 +136,7 @@ func (cfg *StorageConfig) RegisterFlags(f *flag.FlagSet) {
 
 	f.Var(&cfg.S3, "s3.url", "S3 endpoint URL with escaped Key and Secret encoded. "+
 		"If only region is specified as a host, proper endpoint will be deduced. Use inmemory:///<bucket-name> to use a mock in-memory implementation.")
+	f.BoolVar(&cfg.S3ForcePathStyle, "s3.force-path-style", false, "Set this to `true` to force the request to use path-style addressing.")
 }
 
 type dynamoDBStorageClient struct {
@@ -140,6 +144,8 @@ type dynamoDBStorageClient struct {
 	schemaCfg chunk.SchemaConfig
 
 	DynamoDB dynamodbiface.DynamoDBAPI
+	// These rate-limiters let us slow down when DynamoDB signals provision limits.
+	writeThrottle *rate.Limiter
 
 	// These functions exists for mocking, so we don't have to write a whole load
 	// of boilerplate.
@@ -166,9 +172,10 @@ func newDynamoDBStorageClient(cfg DynamoDBConfig, schemaCfg chunk.SchemaConfig) 
 	}
 
 	client := &dynamoDBStorageClient{
-		cfg:       cfg,
-		schemaCfg: schemaCfg,
-		DynamoDB:  dynamoDB,
+		cfg:           cfg,
+		schemaCfg:     schemaCfg,
+		DynamoDB:      dynamoDB,
+		writeThrottle: rate.NewLimiter(rate.Limit(cfg.ThrottleLimit), dynamoDBMaxWriteBatchSize),
 	}
 	client.queryRequestFn = client.queryRequest
 	client.batchGetItemRequestFn = client.batchGetItemRequest
@@ -185,9 +192,10 @@ func (a dynamoDBStorageClient) NewWriteBatch() chunk.WriteBatch {
 	return dynamoDBWriteBatch(map[string][]*dynamodb.WriteRequest{})
 }
 
-func logRetry(ctx context.Context, unprocessed dynamoDBWriteBatch) {
+func logWriteRetry(ctx context.Context, unprocessed dynamoDBWriteBatch) {
 	userID, _ := user.ExtractOrgID(ctx)
 	for table, reqs := range unprocessed {
+		dynamoThrottled.WithLabelValues("DynamoDB.BatchWriteItem", table).Add(float64(len(reqs)))
 		for _, req := range reqs {
 			item := req.PutRequest.Item
 			var hash, rnge string
@@ -212,9 +220,6 @@ func (a dynamoDBStorageClient) BatchWrite(ctx context.Context, input chunk.Write
 	unprocessed := dynamoDBWriteBatch{}
 
 	backoff := util.NewBackoff(ctx, a.cfg.backoffConfig)
-	defer func() {
-		dynamoQueryRetryCount.WithLabelValues("BatchWrite").Observe(float64(backoff.NumRetries()))
-	}()
 
 	for outstanding.Len()+unprocessed.Len() > 0 && backoff.Ongoing() {
 		requests := dynamoDBWriteBatch{}
@@ -244,8 +249,9 @@ func (a dynamoDBStorageClient) BatchWrite(ctx context.Context, input chunk.Write
 			// If we get provisionedThroughputExceededException, then no items were processed,
 			// so back off and retry all.
 			if awsErr, ok := err.(awserr.Error); ok && ((awsErr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException) || request.Retryable()) {
-				logRetry(ctx, requests)
+				logWriteRetry(ctx, requests)
 				unprocessed.TakeReqs(requests, -1)
+				a.writeThrottle.WaitN(ctx, len(requests))
 				backoff.Wait()
 				continue
 			} else if ok && awsErr.Code() == validationException {
@@ -266,8 +272,10 @@ func (a dynamoDBStorageClient) BatchWrite(ctx context.Context, input chunk.Write
 		}
 
 		// If there are unprocessed items, retry those items.
-		if unprocessedItems := resp.UnprocessedItems; unprocessedItems != nil && dynamoDBWriteBatch(unprocessedItems).Len() > 0 {
-			logRetry(ctx, dynamoDBWriteBatch(unprocessedItems))
+		unprocessedItems := dynamoDBWriteBatch(resp.UnprocessedItems)
+		if len(unprocessedItems) > 0 {
+			logWriteRetry(ctx, unprocessedItems)
+			a.writeThrottle.WaitN(ctx, unprocessedItems.Len())
 			unprocessed.TakeReqs(unprocessedItems, -1)
 		}
 
@@ -354,9 +362,6 @@ func (a dynamoDBStorageClient) query(ctx context.Context, query chunk.IndexQuery
 
 func (a dynamoDBStorageClient) queryPage(ctx context.Context, input *dynamodb.QueryInput, page dynamoDBRequest, hashValue string, pageCount int) (*dynamoDBReadResponse, error) {
 	backoff := util.NewBackoff(ctx, a.cfg.backoffConfig)
-	defer func() {
-		dynamoQueryRetryCount.WithLabelValues("queryPage").Observe(float64(backoff.NumRetries()))
-	}()
 
 	var err error
 	for backoff.Ongoing() {
@@ -464,9 +469,9 @@ type chunksPlusError struct {
 
 // GetChunks implements chunk.ObjectClient.
 func (a dynamoDBStorageClient) GetChunks(ctx context.Context, chunks []chunk.Chunk) ([]chunk.Chunk, error) {
-	sp, ctx := ot.StartSpanFromContext(ctx, "GetChunks.DynamoDB")
-	defer sp.Finish()
-	sp.LogFields(otlog.Int("chunks requested", len(chunks)))
+	log, ctx := spanlogger.New(ctx, "GetChunks.DynamoDB", ot.Tag{Key: "numChunks", Value: len(chunks)})
+	defer log.Span.Finish()
+	level.Debug(log).Log("chunks requested", len(chunks))
 
 	dynamoDBChunks := chunks
 	var err error
@@ -499,13 +504,10 @@ func (a dynamoDBStorageClient) GetChunks(ctx context.Context, chunks []chunk.Chu
 		}
 		finalChunks = append(finalChunks, in.chunks...)
 	}
-	sp.LogFields(otlog.Int("chunks fetched", len(finalChunks)))
-	if err != nil {
-		sp.LogFields(otlog.String("error", err.Error()))
-	}
+	level.Debug(log).Log("chunks fetched", len(finalChunks))
 
 	// Return any chunks we did receive: a partial result may be useful
-	return finalChunks, err
+	return finalChunks, log.Error(err)
 }
 
 // As we're re-using the DynamoDB schema from the index for the chunk tables,
@@ -516,8 +518,8 @@ var placeholder = []byte{'c'}
 // Structure is identical to BatchWrite(), but operating on different datatypes
 // so cannot share implementation.  If you fix a bug here fix it there too.
 func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []chunk.Chunk) ([]chunk.Chunk, error) {
-	sp, ctx := ot.StartSpanFromContext(ctx, "getDynamoDBChunks", ot.Tag{Key: "numChunks", Value: len(chunks)})
-	defer sp.Finish()
+	log, ctx := spanlogger.New(ctx, "getDynamoDBChunks", ot.Tag{Key: "numChunks", Value: len(chunks)})
+	defer log.Span.Finish()
 	outstanding := dynamoDBReadRequest{}
 	chunksByKey := map[string]chunk.Chunk{}
 	for _, chunk := range chunks {
@@ -525,7 +527,7 @@ func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []c
 		chunksByKey[key] = chunk
 		tableName, err := a.schemaCfg.ChunkTableFor(chunk.From)
 		if err != nil {
-			return nil, err
+			return nil, log.Error(err)
 		}
 		outstanding.Add(tableName, key, placeholder)
 	}
@@ -533,9 +535,6 @@ func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []c
 	result := []chunk.Chunk{}
 	unprocessed := dynamoDBReadRequest{}
 	backoff := util.NewBackoff(ctx, a.cfg.backoffConfig)
-	defer func() {
-		dynamoQueryRetryCount.WithLabelValues("getDynamoDBChunks").Observe(float64(backoff.NumRetries()))
-	}()
 
 	for outstanding.Len()+unprocessed.Len() > 0 && backoff.Ongoing() {
 		requests := dynamoDBReadRequest{}
@@ -570,9 +569,8 @@ func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []c
 				continue
 			} else if ok && awsErr.Code() == validationException {
 				// this read will never work, so the only option is to drop the offending request and continue.
-				level.Warn(util.Logger).Log("msg", "Error while fetching data from Dynamo", "err", awsErr)
-				level.Debug(util.Logger).Log("msg", "Dropped request details", "requests", requests)
-				util.Event().Log("msg", "ValidationException", "requests", requests)
+				level.Warn(log).Log("msg", "Error while fetching data from Dynamo", "err", awsErr)
+				level.Debug(log).Log("msg", "Dropped request details", "requests", requests)
 				// recording the drop counter separately from recordDynamoError(), as the error code alone may not provide enough context
 				// to determine if a request was dropped (or not)
 				for tableName := range requests {
@@ -587,7 +585,7 @@ func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []c
 
 		processedChunks, err := processChunkResponse(response, chunksByKey)
 		if err != nil {
-			return nil, err
+			return nil, log.Error(err)
 		}
 		result = append(result, processedChunks...)
 
@@ -601,7 +599,7 @@ func (a dynamoDBStorageClient) getDynamoDBChunks(ctx context.Context, chunks []c
 
 	if valuesLeft := outstanding.Len() + unprocessed.Len(); valuesLeft > 0 {
 		// Return the chunks we did fetch, because partial results may be useful
-		return result, fmt.Errorf("failed to query chunks, %d values remaining: %s", valuesLeft, backoff.Err())
+		return result, log.Error(fmt.Errorf("failed to query chunks, %d values remaining: %s", valuesLeft, backoff.Err()))
 	}
 	return result, nil
 }
@@ -636,8 +634,27 @@ func processChunkResponse(response *dynamodb.BatchGetItemOutput, chunksByKey map
 	return result, nil
 }
 
+// PutChunkAndIndex implements chunk.ObjectAndIndexClient
+// Combine both sets of writes before sending to DynamoDB, for performance
+func (a dynamoDBStorageClient) PutChunkAndIndex(ctx context.Context, c chunk.Chunk, index chunk.WriteBatch) error {
+	dynamoDBWrites, err := a.writesForChunks([]chunk.Chunk{c})
+	if err != nil {
+		return err
+	}
+	dynamoDBWrites.TakeReqs(index.(dynamoDBWriteBatch), 0)
+	return a.BatchWrite(ctx, dynamoDBWrites)
+}
+
 // PutChunks implements chunk.ObjectClient.
 func (a dynamoDBStorageClient) PutChunks(ctx context.Context, chunks []chunk.Chunk) error {
+	dynamoDBWrites, err := a.writesForChunks(chunks)
+	if err != nil {
+		return err
+	}
+	return a.BatchWrite(ctx, dynamoDBWrites)
+}
+
+func (a dynamoDBStorageClient) writesForChunks(chunks []chunk.Chunk) (dynamoDBWriteBatch, error) {
 	var (
 		dynamoDBWrites = dynamoDBWriteBatch{}
 	)
@@ -645,19 +662,19 @@ func (a dynamoDBStorageClient) PutChunks(ctx context.Context, chunks []chunk.Chu
 	for i := range chunks {
 		buf, err := chunks[i].Encoded()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		key := chunks[i].ExternalKey()
 
 		table, err := a.schemaCfg.ChunkTableFor(chunks[i].From)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		dynamoDBWrites.Add(table, key, placeholder, buf)
 	}
 
-	return a.BatchWrite(ctx, dynamoDBWrites)
+	return dynamoDBWrites, nil
 }
 
 // Slice of values returned; map key is attribute name

@@ -46,7 +46,7 @@ For instructions on how to query Loki, see [our usage docs](../docs/usage.md).
 
 ## Using Helm to deploy on Kubernetes
 
-There is a [Helm chart](helm/loki) to deploy Loki and promtail to Kubernetes.
+There is a [Helm chart](helm) to deploy Loki and promtail to Kubernetes.
 
 ## Build and Run From Source
 
@@ -64,10 +64,39 @@ $ ./loki -config.file=./cmd/loki/loki-local-config.yaml
 ...
 ```
 
-To run Promtail, use the following commands:
+To build Promtail on non-Linux platforms, use the following command:
 
 ```bash
 $ go build ./cmd/promtail
+```
+
+On Linux, promtail requires the systemd headers to be installed for
+Journal support.
+
+With Journal support on Ubuntu, run with the following commands:
+
+```bash
+$ sudo apt install -y libsystemd-dev
+$ go build ./cmd/promtail
+```
+
+With Journal support on CentOS, run with the following commands:
+
+```bash
+$ sudo yum install -y systemd-devel
+$ go build ./cmd/promtail
+```
+
+Otherwise, to build promtail without Journal support, run `go build`
+with CGO disabled:
+
+```bash
+$ CGO_ENABLED=0 go build ./cmd/promtail
+```
+
+Once Promtail is built, to run Promtail, use the following command:
+
+```bash
 $ ./promtail -config.file=./cmd/promtail/promtail-local-config.yaml
 ...
 ```

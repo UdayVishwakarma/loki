@@ -23,29 +23,22 @@ This can have several reasons:
   - Detect this by turning on debug logging and then look for `dropping target, no labels` or `ignoring target` messages.
 - Promtail cannot find the location of your log files. Check that the scrape_configs contains valid path setting for finding the logs in your worker nodes.
 - Your pods are running but not with the labels Promtail is expecting. Check the Promtail scape_configs.
-- Kubernetes 1.14+ and GKE 1.12+: the default scape_configs need to be adapted to work. 
-From
-```
-        - replacement: /var/log/pods/$1/*.log
-          separator: /
-          source_labels:
-          - __meta_kubernetes_pod_uid
-          - __meta_kubernetes_pod_container_name
-          target_label: __path__
-```
-to
-```
-        - replacement: /var/log/pods/*$1*/*/*.log
-          source_labels:
-          - __meta_kubernetes_pod_uid
-          target_label: __path__
+
+## Troubleshooting targets
+
+Promtail offers two pages that you can use to understand how service discovery works.
+The service discovery page (`/service-discovery`) shows all discovered targets with their labels before and after relabeling as well as the reason why the target has been dropped.
+The targets page (`/targets`) however displays only targets being actively scraped with their respective labels, files and positions.
+
+You can access those two pages by port-forwarding the promtail port (9080 or 3101 via helm) locally:
+
+```bash
+kubectl port-forward loki-promtail-jrfg7 9080
 ```
 
 ## Debug output
 
 Both binaries support a log level parameter on the command-line, e.g.: `loki —log.level= debug ...`
-
-## No labels:
 
 ## Failed to create target, "ioutil.ReadDir: readdirent: not a directory"
 
@@ -53,7 +46,7 @@ The promtail configuration contains a `__path__` entry to a directory that promt
 
 ## Connecting to a promtail pod to troubleshoot
 
-Say you are missing logs from your nginx pod and want to investigate promtail.
+First check *Troubleshooting targets* section above, if that doesn't help answer your questions you can connect to the promtail pod to further investigate.
 
 In your cluster if you are running promtail as a daemonset, you will have a promtail pod on each node, to figure out which promtail you want run:
 
@@ -82,3 +75,13 @@ Once connected, verify the config in `/etc/promtail/promtail.yml` is what you ex
 Also check `/var/log/positions.yaml` and make sure promtail is tailing the logs you would expect
 
 You can check the promtail log by looking in `/var/log/containers` at the promtail container log
+
+## Enable tracing for loki
+
+We support (jaeger)[https://www.jaegertracing.io/] to trace loki, just add env `JAEGER_AGENT_HOST` to where loki run, and you can use jaeger to trace.
+
+If you deploy with helm, refer to following command:
+
+```bash
+$ helm upgrade --install loki loki/loki --set "loki.tracing.jaegerAgentHost=YOUR_JAEGER_AGENT_HOST"
+```

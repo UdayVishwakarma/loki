@@ -30,7 +30,8 @@
 
 [[constraint]]
   name = "github.com/weaveworks/common"
-  branch = "master"
+  source = "https://github.com/tomwilkie/weaveworks-common"
+  branch = "server-listen-addr"
 
 [[constraint]]
   name = "gopkg.in/fsnotify.v1"
@@ -70,3 +71,10 @@
   name = "github.com/hpcloud/tail"
   source = "github.com/grafana/tail"
   branch = "master"
+
+[[override]]
+  name = "k8s.io/client-go"
+  revision = "1a26190bd76a9017e289958b9fba936430aa3704"
+[[constraint]]
+  name = "github.com/stretchr/testify"
+  version = "1.3.0"

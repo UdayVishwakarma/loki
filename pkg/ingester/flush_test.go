@@ -2,7 +2,6 @@ package ingester
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -10,12 +9,13 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/ring"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
-	"github.com/go-kit/kit/log"
 	"github.com/grafana/loki/pkg/chunkenc"
+	"github.com/grafana/loki/pkg/ingester/client"
+	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/net/context"
@@ -27,7 +27,7 @@ const (
 )
 
 func init() {
-	util.Logger = log.NewLogfmtLogger(os.Stdout)
+	//util.Logger = log.NewLogfmtLogger(os.Stdout)
 }
 
 func TestChunkFlushingIdle(t *testing.T) {
@@ -62,28 +62,26 @@ func newTestStore(t require.TestingT, cfg Config) (*testStore, *Ingester) {
 		chunks: map[string][]chunk.Chunk{},
 	}
 
-	ing, err := New(cfg, store)
+	ing, err := New(cfg, client.Config{}, store)
 	require.NoError(t, err)
 
 	return store, ing
 }
 
-func newDefaultTestStore(t require.TestingT) (*testStore, *Ingester) {
-	return newTestStore(t, defaultIngesterTestConfig())
-}
-
+// nolint
 func defaultIngesterTestConfig() Config {
-	consul := ring.NewInMemoryKVClient()
+	consul := ring.NewInMemoryKVClient(ring.ProtoCodec{Factory: ring.ProtoDescFactory})
 	cfg := Config{}
 	flagext.DefaultValues(&cfg)
 	cfg.FlushCheckPeriod = 99999 * time.Hour
 	cfg.MaxChunkIdle = 99999 * time.Hour
 	cfg.ConcurrentFlushes = 1
-	cfg.LifecyclerConfig.RingConfig.Mock = consul
+	cfg.LifecyclerConfig.RingConfig.KVStore.Mock = consul
 	cfg.LifecyclerConfig.NumTokens = 1
 	cfg.LifecyclerConfig.ListenPort = func(i int) *int { return &i }(0)
 	cfg.LifecyclerConfig.Addr = "localhost"
 	cfg.LifecyclerConfig.ID = "localhost"
+	cfg.LifecyclerConfig.FinalSleep = 0
 	return cfg
 }
 
@@ -96,9 +94,9 @@ func (s *testStore) Put(ctx context.Context, chunks []chunk.Chunk) error {
 		return err
 	}
 	for _, chunk := range chunks {
-		for k, v := range chunk.Metric {
-			if v == "" {
-				return fmt.Errorf("Chunk has blank label %q", k)
+		for _, label := range chunk.Metric {
+			if label.Value == "" {
+				return fmt.Errorf("Chunk has blank label %q", label.Name)
 			}
 		}
 	}
@@ -106,9 +104,17 @@ func (s *testStore) Put(ctx context.Context, chunks []chunk.Chunk) error {
 	return nil
 }
 
+func (s *testStore) IsLocal() bool {
+	return false
+}
+
+func (s *testStore) LazyQuery(ctx context.Context, req *logproto.QueryRequest) (iter.EntryIterator, error) {
+	return nil, nil
+}
+
 func (s *testStore) Stop() {}
 
-func pushTestSamples(t *testing.T, ing *Ingester) ([]string, map[string][]*logproto.Stream) {
+func pushTestSamples(t *testing.T, ing logproto.PusherServer) ([]string, map[string][]*logproto.Stream) {
 	userIDs := []string{"1", "2", "3"}
 
 	// Create test samples.
@@ -162,7 +168,11 @@ func (s *testStore) checkData(t *testing.T, userIDs []string, testData map[strin
 		streams := []*logproto.Stream{}
 		for _, chunk := range chunks {
 			lokiChunk := chunk.Data.(*chunkenc.Facade).LokiChunk()
-			delete(chunk.Metric, nameLabel)
+			if chunk.Metric.Has("__name__") {
+				labelsBuilder := labels.NewBuilder(chunk.Metric)
+				labelsBuilder.Del("__name__")
+				chunk.Metric = labelsBuilder.Labels()
+			}
 			labels := chunk.Metric.String()
 			streams = append(streams, buildStreamsFromChunk(t, labels, lokiChunk))
 		}
@@ -174,7 +184,7 @@ func (s *testStore) checkData(t *testing.T, userIDs []string, testData map[strin
 }
 
 func buildStreamsFromChunk(t *testing.T, labels string, chk chunkenc.Chunk) *logproto.Stream {
-	it, err := chk.Iterator(time.Unix(0, 0), time.Unix(1000, 0), logproto.FORWARD)
+	it, err := chk.Iterator(time.Unix(0, 0), time.Unix(1000, 0), logproto.FORWARD, nil)
 	require.NoError(t, err)
 
 	stream := &logproto.Stream{

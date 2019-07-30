@@ -21,6 +21,8 @@ import (
 const (
 	readLabel  = "read"
 	writeLabel = "write"
+
+	bucketRetentionEnforcementInterval = 12 * time.Hour
 )
 
 var (
@@ -45,39 +47,39 @@ func init() {
 // TableManagerConfig holds config for a TableManager
 type TableManagerConfig struct {
 	// Master 'off-switch' for table capacity updates, e.g. when troubleshooting
-	ThroughputUpdatesDisabled bool
+	ThroughputUpdatesDisabled bool `yaml:"throughput_updates_disabled"`
 
 	// Master 'on-switch' for table retention deletions
-	RetentionDeletesEnabled bool
+	RetentionDeletesEnabled bool `yaml:"retention_deletes_enabled"`
 
 	// How far back tables will be kept before they are deleted
-	RetentionPeriod time.Duration
+	RetentionPeriod time.Duration `yaml:"retention_period"`
 
 	// Period with which the table manager will poll for tables.
-	DynamoDBPollInterval time.Duration
+	DynamoDBPollInterval time.Duration `yaml:"dynamodb_poll_interval"`
 
 	// duration a table will be created before it is needed.
-	CreationGracePeriod time.Duration
+	CreationGracePeriod time.Duration `yaml:"creation_grace_period"`
 
-	IndexTables ProvisionConfig
-	ChunkTables ProvisionConfig
+	IndexTables ProvisionConfig `yaml:"index_tables_provisioning"`
+	ChunkTables ProvisionConfig `yaml:"chunk_tables_provisioning"`
 }
 
 // ProvisionConfig holds config for provisioning capacity (on DynamoDB)
 type ProvisionConfig struct {
-	ProvisionedThroughputOnDemandMode bool
-	ProvisionedWriteThroughput        int64
-	ProvisionedReadThroughput         int64
-	InactiveThroughputOnDemandMode    bool
-	InactiveWriteThroughput           int64
-	InactiveReadThroughput            int64
+	ProvisionedThroughputOnDemandMode bool  `yaml:"provisioned_throughput_on_demand_mode"`
+	ProvisionedWriteThroughput        int64 `yaml:"provisioned_write_throughput"`
+	ProvisionedReadThroughput         int64 `yaml:"provisioned_read_throughput"`
+	InactiveThroughputOnDemandMode    bool  `yaml:"inactive_throughput_on_demand_mode"`
+	InactiveWriteThroughput           int64 `yaml:"inactive_write_throughput"`
+	InactiveReadThroughput            int64 `yaml:"inactive_read_throughput"`
 
-	WriteScale              AutoScalingConfig
-	InactiveWriteScale      AutoScalingConfig
-	InactiveWriteScaleLastN int64
-	ReadScale               AutoScalingConfig
-	InactiveReadScale       AutoScalingConfig
-	InactiveReadScaleLastN  int64
+	WriteScale              AutoScalingConfig `yaml:"write_scale"`
+	InactiveWriteScale      AutoScalingConfig `yaml:"inactive_write_scale"`
+	InactiveWriteScaleLastN int64             `yaml:"inactive_write_scale_lastn"`
+	ReadScale               AutoScalingConfig `yaml:"read_scale"`
+	InactiveReadScale       AutoScalingConfig `yaml:"inactive_read_scale"`
+	InactiveReadScaleLastN  int64             `yaml:"inactive_read_scale_lastn"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
@@ -110,66 +112,27 @@ func (cfg *ProvisionConfig) RegisterFlags(argPrefix string, f *flag.FlagSet) {
 	f.Int64Var(&cfg.InactiveReadScaleLastN, argPrefix+".inactive-read-throughput.scale-last-n", 4, "Number of last inactive tables to enable read autoscale.")
 }
 
-// Tags is a string-string map that implements flag.Value.
-type Tags map[string]string
-
-// String implements flag.Value
-func (ts Tags) String() string {
-	if ts == nil {
-		return ""
-	}
-
-	return fmt.Sprintf("%v", map[string]string(ts))
-}
-
-// Set implements flag.Value
-func (ts *Tags) Set(s string) error {
-	if *ts == nil {
-		*ts = map[string]string{}
-	}
-
-	parts := strings.SplitN(s, "=", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("tag must of the format key=value")
-	}
-	(*ts)[parts[0]] = parts[1]
-	return nil
-}
-
-// Equals returns true is other matches ts.
-func (ts Tags) Equals(other Tags) bool {
-	if len(ts) != len(other) {
-		return false
-	}
-
-	for k, v1 := range ts {
-		v2, ok := other[k]
-		if !ok || v1 != v2 {
-			return false
-		}
-	}
-
-	return true
-}
-
 // TableManager creates and manages the provisioned throughput on DynamoDB tables
 type TableManager struct {
-	client      TableClient
-	cfg         TableManagerConfig
-	schemaCfg   SchemaConfig
-	maxChunkAge time.Duration
-	done        chan struct{}
-	wait        sync.WaitGroup
+	client       TableClient
+	cfg          TableManagerConfig
+	schemaCfg    SchemaConfig
+	maxChunkAge  time.Duration
+	done         chan struct{}
+	wait         sync.WaitGroup
+	bucketClient BucketClient
 }
 
 // NewTableManager makes a new TableManager
-func NewTableManager(cfg TableManagerConfig, schemaCfg SchemaConfig, maxChunkAge time.Duration, tableClient TableClient) (*TableManager, error) {
+func NewTableManager(cfg TableManagerConfig, schemaCfg SchemaConfig, maxChunkAge time.Duration, tableClient TableClient,
+	objectClient BucketClient) (*TableManager, error) {
 	return &TableManager{
-		cfg:         cfg,
-		schemaCfg:   schemaCfg,
-		maxChunkAge: maxChunkAge,
-		client:      tableClient,
-		done:        make(chan struct{}),
+		cfg:          cfg,
+		schemaCfg:    schemaCfg,
+		maxChunkAge:  maxChunkAge,
+		client:       tableClient,
+		done:         make(chan struct{}),
+		bucketClient: objectClient,
 	}, nil
 }
 
@@ -177,6 +140,11 @@ func NewTableManager(cfg TableManagerConfig, schemaCfg SchemaConfig, maxChunkAge
 func (m *TableManager) Start() {
 	m.wait.Add(1)
 	go m.loop()
+
+	if m.bucketClient != nil && m.cfg.RetentionPeriod != 0 && m.cfg.RetentionDeletesEnabled == true {
+		m.wait.Add(1)
+		go m.bucketRetentionLoop()
+	}
 }
 
 // Stop the TableManager
@@ -211,6 +179,26 @@ func (m *TableManager) loop() {
 	}
 }
 
+func (m *TableManager) bucketRetentionLoop() {
+	defer m.wait.Done()
+
+	ticker := time.NewTicker(bucketRetentionEnforcementInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			err := m.bucketClient.DeleteChunksBefore(context.Background(), mtime.Now().Add(-m.cfg.RetentionPeriod))
+
+			if err != nil {
+				level.Error(util.Logger).Log("msg", "error enforcing filesystem retention", "err", err)
+			}
+		case <-m.done:
+			return
+		}
+	}
+}
+
 // SyncTables will calculate the tables expected to exist, create those that do
 // not and update those that need it.  It is exposed for testing.
 func (m *TableManager) SyncTables(ctx context.Context) error {
@@ -237,7 +225,7 @@ func (m *TableManager) calculateExpectedTables() []TableDesc {
 	result := []TableDesc{}
 
 	for i, config := range m.schemaCfg.Configs {
-		if config.From.Time().After(mtime.Now()) {
+		if config.From.Time.Time().After(mtime.Now()) {
 			continue
 		}
 		if config.IndexTables.Period == 0 { // non-periodic table
@@ -282,18 +270,18 @@ func (m *TableManager) calculateExpectedTables() []TableDesc {
 		} else {
 			endTime := mtime.Now().Add(m.cfg.CreationGracePeriod)
 			if i+1 < len(m.schemaCfg.Configs) {
-				nextFrom := m.schemaCfg.Configs[i+1].From.Time()
+				nextFrom := m.schemaCfg.Configs[i+1].From.Time.Time()
 				if endTime.After(nextFrom) {
 					endTime = nextFrom
 				}
 			}
 			endModelTime := model.TimeFromUnix(endTime.Unix())
 			result = append(result, config.IndexTables.periodicTables(
-				config.From, endModelTime, m.cfg.IndexTables, m.cfg.CreationGracePeriod, m.maxChunkAge, m.cfg.RetentionPeriod,
+				config.From.Time, endModelTime, m.cfg.IndexTables, m.cfg.CreationGracePeriod, m.maxChunkAge, m.cfg.RetentionPeriod,
 			)...)
 			if config.ChunkTables.Prefix != "" {
 				result = append(result, config.ChunkTables.periodicTables(
-					config.From, endModelTime, m.cfg.ChunkTables, m.cfg.CreationGracePeriod, m.maxChunkAge, m.cfg.RetentionPeriod,
+					config.From.Time, endModelTime, m.cfg.ChunkTables, m.cfg.CreationGracePeriod, m.maxChunkAge, m.cfg.RetentionPeriod,
 				)...)
 			}
 		}
@@ -333,8 +321,12 @@ func (m *TableManager) partitionTables(ctx context.Context, descriptions []Table
 		// Ensure we only delete tables which have a prefix managed by Cortex.
 		tablePrefixes := map[string]struct{}{}
 		for _, cfg := range m.schemaCfg.Configs {
-			tablePrefixes[cfg.IndexTables.Prefix] = struct{}{}
-			tablePrefixes[cfg.ChunkTables.Prefix] = struct{}{}
+			if cfg.IndexTables.Prefix != "" {
+				tablePrefixes[cfg.IndexTables.Prefix] = struct{}{}
+			}
+			if cfg.ChunkTables.Prefix != "" {
+				tablePrefixes[cfg.ChunkTables.Prefix] = struct{}{}
+			}
 		}
 
 		for existingTable := range existingTables {

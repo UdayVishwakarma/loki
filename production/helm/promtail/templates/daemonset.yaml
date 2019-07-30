@@ -24,8 +24,14 @@ spec:
       labels:
         app: {{ template "promtail.name" . }}
         release: {{ .Release.Name }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}          
       annotations:
-        {{ toYaml .Values.podAnnotations | nindent 8 }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ template "promtail.serviceAccountName" . }}
     {{- if .Values.priorityClassName }}
@@ -37,7 +43,11 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "-config.file=/etc/promtail/promtail.yaml"
-            - "-client.url=http://{{ include "loki.serviceName" . }}:{{ .Values.loki.servicePort }}/api/prom/push"
+            {{- if and .Values.loki.user .Values.loki.password }}
+            - "-client.url={{ .Values.loki.serviceScheme }}://{{ .Values.loki.user }}:{{ .Values.loki.password }}@{{ include "loki.serviceName" . }}:{{ .Values.loki.servicePort }}/api/prom/push"
+            {{- else }}
+            - "-client.url={{ .Values.loki.serviceScheme }}://{{ include "loki.serviceName" . }}:{{ .Values.loki.servicePort }}/api/prom/push"
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/promtail
@@ -52,7 +62,7 @@ spec:
               fieldRef:
                 fieldPath: spec.nodeName
           ports:
-            - containerPort: {{ .Values.port }}
+            - containerPort: {{ .Values.config.server.http_listen_port }}
               name: http-metrics
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}

@@ -31,22 +31,26 @@ var (
 		Name:      "file_bytes_total",
 		Help:      "Number of bytes total.",
 	}, []string{"path"})
-
 	readLines = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "promtail",
 		Name:      "read_lines_total",
 		Help:      "Number of lines read.",
 	}, []string{"path"})
-
 	filesActive = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "promtail",
 		Name:      "files_active_total",
 		Help:      "Number of active files.",
 	})
+	logLengthHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "promtail",
+		Name:      "log_entries_bytes",
+		Help:      "the total count of bytes",
+		Buckets:   prometheus.ExponentialBuckets(16, 2, 8),
+	}, []string{"path"})
 )
 
 const (
-	filenameLabel = "__filename__"
+	FilenameLabel = "filename"
 )
 
 // Config describes behavior for Target
@@ -63,8 +67,10 @@ func (cfg *Config) RegisterFlags(flags *flag.FlagSet) {
 type FileTarget struct {
 	logger log.Logger
 
-	handler   api.EntryHandler
-	positions *positions.Positions
+	handler          api.EntryHandler
+	positions        *positions.Positions
+	labels           model.LabelSet
+	discoveredLabels model.LabelSet
 
 	watcher *fsnotify.Watcher
 	watches map[string]struct{}
@@ -78,7 +84,7 @@ type FileTarget struct {
 }
 
 // NewFileTarget create a new FileTarget.
-func NewFileTarget(logger log.Logger, handler api.EntryHandler, positions *positions.Positions, path string, labels model.LabelSet, targetConfig *Config) (*FileTarget, error) {
+func NewFileTarget(logger log.Logger, handler api.EntryHandler, positions *positions.Positions, path string, labels model.LabelSet, discoveredLabels model.LabelSet, targetConfig *Config) (*FileTarget, error) {
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -86,15 +92,17 @@ func NewFileTarget(logger log.Logger, handler api.EntryHandler, positions *posit
 	}
 
 	t := &FileTarget{
-		logger:       logger,
-		watcher:      watcher,
-		path:         path,
-		handler:      api.AddLabelsMiddleware(labels).Wrap(handler),
-		positions:    positions,
-		quit:         make(chan struct{}),
-		done:         make(chan struct{}),
-		tails:        map[string]*tailer{},
-		targetConfig: targetConfig,
+		logger:           logger,
+		watcher:          watcher,
+		path:             path,
+		labels:           labels,
+		discoveredLabels: discoveredLabels,
+		handler:          api.AddLabelsMiddleware(labels).Wrap(handler),
+		positions:        positions,
+		quit:             make(chan struct{}),
+		done:             make(chan struct{}),
+		tails:            map[string]*tailer{},
+		targetConfig:     targetConfig,
 	}
 
 	err = t.sync()
@@ -117,6 +125,30 @@ func (t *FileTarget) Stop() {
 	<-t.done
 }
 
+// Type implements a Target
+func (t *FileTarget) Type() TargetType {
+	return FileTargetType
+}
+
+// DiscoveredLabels implements a Target
+func (t *FileTarget) DiscoveredLabels() model.LabelSet {
+	return t.discoveredLabels
+}
+
+// Labels implements a Target
+func (t *FileTarget) Labels() model.LabelSet {
+	return t.labels
+}
+
+// Details implements a Target
+func (t *FileTarget) Details() interface{} {
+	files := map[string]int64{}
+	for fileName := range t.tails {
+		files[fileName], _ = t.positions.Get(fileName)
+	}
+	return files
+}
+
 func (t *FileTarget) run() {
 	defer func() {
 		helpers.LogError("closing watcher", t.watcher.Close)
@@ -135,7 +167,7 @@ func (t *FileTarget) run() {
 		case event := <-t.watcher.Events:
 			switch event.Op {
 			case fsnotify.Create:
-				matched, err := filepath.Match(t.path, event.Name)
+				matched, err := doublestar.Match(t.path, event.Name)
 				if err != nil {
 					level.Error(t.logger).Log("msg", "failed to match file", "error", err, "filename", event.Name)
 					continue
@@ -146,7 +178,7 @@ func (t *FileTarget) run() {
 				}
 				t.startTailing([]string{event.Name})
 			default:
-				level.Debug(t.logger).Log("msg", "got unknown event", "event", event)
+				// No-op we only care about Create events
 			}
 		case err := <-t.watcher.Errors:
 			level.Error(t.logger).Log("msg", "error from fswatch", "error", err)

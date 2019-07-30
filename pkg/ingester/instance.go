@@ -12,11 +12,12 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ingester/index"
+	cutil "github.com/cortexproject/cortex/pkg/util"
 
 	"github.com/grafana/loki/pkg/helpers"
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/parser"
+	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/querier"
 	"github.com/grafana/loki/pkg/util"
 )
@@ -50,9 +51,13 @@ type instance struct {
 
 	streamsCreatedTotal prometheus.Counter
 	streamsRemovedTotal prometheus.Counter
+
+	blockSize int
+	tailers   map[uint32]*tailer
+	tailerMtx sync.RWMutex
 }
 
-func newInstance(instanceID string) *instance {
+func newInstance(instanceID string, blockSize int) *instance {
 	return &instance{
 		streams:    map[model.Fingerprint]*stream{},
 		index:      index.New(),
@@ -60,7 +65,29 @@ func newInstance(instanceID string) *instance {
 
 		streamsCreatedTotal: streamsCreatedTotal.WithLabelValues(instanceID),
 		streamsRemovedTotal: streamsRemovedTotal.WithLabelValues(instanceID),
+
+		blockSize: blockSize,
+		tailers:   map[uint32]*tailer{},
 	}
+}
+
+// consumeChunk manually adds a chunk that was received during ingester chunk
+// transfer.
+func (i *instance) consumeChunk(ctx context.Context, labels []client.LabelAdapter, chunk *logproto.Chunk) error {
+	i.streamsMtx.Lock()
+	defer i.streamsMtx.Unlock()
+
+	fp := client.FastFingerprint(labels)
+	stream, ok := i.streams[fp]
+	if !ok {
+		stream = newStream(fp, labels, i.blockSize)
+		i.index.Add(labels, fp)
+		i.streams[fp] = stream
+		i.streamsCreatedTotal.Inc()
+		i.addTailersToNewStream(stream)
+	}
+
+	return stream.consumeChunk(ctx, chunk)
 }
 
 func (i *instance) Push(ctx context.Context, req *logproto.PushRequest) error {
@@ -78,10 +105,11 @@ func (i *instance) Push(ctx context.Context, req *logproto.PushRequest) error {
 		fp := client.FastFingerprint(labels)
 		stream, ok := i.streams[fp]
 		if !ok {
-			stream = newStream(fp, labels)
+			stream = newStream(fp, labels, i.blockSize)
 			i.index.Add(labels, fp)
 			i.streams[fp] = stream
 			i.streamsCreatedTotal.Inc()
+			i.addTailersToNewStream(stream)
 		}
 
 		if err := stream.Push(ctx, s.Entries); err != nil {
@@ -94,43 +122,46 @@ func (i *instance) Push(ctx context.Context, req *logproto.PushRequest) error {
 }
 
 func (i *instance) Query(req *logproto.QueryRequest, queryServer logproto.Querier_QueryServer) error {
-	matchers, err := parser.Matchers(req.Query)
+	expr, err := logql.ParseExpr(req.Query)
 	if err != nil {
 		return err
 	}
-
-	iterators, err := i.lookupStreams(req, matchers)
-	if err != nil {
-		return err
-	}
-
-	iterator := iter.NewHeapIterator(iterators, req.Direction)
-	defer helpers.LogError("closing iterator", iterator.Close)
 
 	if req.Regex != "" {
-		var err error
-		iterator, err = iter.NewRegexpFilter(req.Regex, iterator)
-		if err != nil {
-			return err
-		}
+		expr = logql.NewFilterExpr(expr, labels.MatchRegexp, req.Regex)
 	}
 
-	return sendBatches(iterator, queryServer, req.Limit)
+	querier := logql.QuerierFunc(func(matchers []*labels.Matcher, filter logql.Filter) (iter.EntryIterator, error) {
+		iters, err := i.lookupStreams(req, matchers, filter)
+		if err != nil {
+			return nil, err
+		}
+
+		return iter.NewHeapIterator(iters, req.Direction), nil
+	})
+
+	iter, err := expr.Eval(querier)
+	if err != nil {
+		return err
+	}
+	defer helpers.LogError("closing iterator", iter.Close)
+
+	return sendBatches(iter, queryServer, req.Limit)
 }
 
-func (i *instance) Label(ctx context.Context, req *logproto.LabelRequest) (*logproto.LabelResponse, error) {
+func (i *instance) Label(_ context.Context, req *logproto.LabelRequest) (*logproto.LabelResponse, error) {
 	var labels []string
 	if req.Values {
-		values := i.index.LabelValues(model.LabelName(req.Name))
+		values := i.index.LabelValues(req.Name)
 		labels = make([]string, len(values))
 		for i := 0; i < len(values); i++ {
-			labels[i] = string(values[i])
+			labels[i] = values[i]
 		}
 	} else {
 		names := i.index.LabelNames()
 		labels = make([]string, len(names))
 		for i := 0; i < len(names); i++ {
-			labels[i] = string(names[i])
+			labels[i] = names[i]
 		}
 	}
 	return &logproto.LabelResponse{
@@ -138,24 +169,80 @@ func (i *instance) Label(ctx context.Context, req *logproto.LabelRequest) (*logp
 	}, nil
 }
 
-func (i *instance) lookupStreams(req *logproto.QueryRequest, matchers []*labels.Matcher) ([]iter.EntryIterator, error) {
+func (i *instance) lookupStreams(req *logproto.QueryRequest, matchers []*labels.Matcher, filter logql.Filter) ([]iter.EntryIterator, error) {
 	i.streamsMtx.RLock()
 	defer i.streamsMtx.RUnlock()
 
-	var err error
+	filters, matchers := cutil.SplitFiltersAndMatchers(matchers)
 	ids := i.index.Lookup(matchers)
-	iterators := make([]iter.EntryIterator, len(ids))
-	for j := range ids {
-		stream, ok := i.streams[ids[j]]
+	iterators := make([]iter.EntryIterator, 0, len(ids))
+
+outer:
+	for _, streamID := range ids {
+		stream, ok := i.streams[streamID]
 		if !ok {
 			return nil, ErrStreamMissing
 		}
-		iterators[j], err = stream.Iterator(req.Start, req.End, req.Direction)
+		lbs := client.FromLabelAdaptersToLabels(stream.labels)
+		for _, filter := range filters {
+			if !filter.Matches(lbs.Get(filter.Name)) {
+				continue outer
+			}
+		}
+		iter, err := stream.Iterator(req.Start, req.End, req.Direction, filter)
 		if err != nil {
 			return nil, err
 		}
+		iterators = append(iterators, iter)
 	}
 	return iterators, nil
+}
+
+func (i *instance) addNewTailer(t *tailer) {
+	i.streamsMtx.RLock()
+	for _, stream := range i.streams {
+		if stream.matchesTailer(t) {
+			stream.addTailer(t)
+		}
+	}
+	i.streamsMtx.RUnlock()
+
+	i.tailerMtx.Lock()
+	defer i.tailerMtx.Unlock()
+	i.tailers[t.getID()] = t
+}
+
+func (i *instance) addTailersToNewStream(stream *stream) {
+	closedTailers := []uint32{}
+
+	i.tailerMtx.RLock()
+	for _, t := range i.tailers {
+		if t.isClosed() {
+			closedTailers = append(closedTailers, t.getID())
+			continue
+		}
+
+		if stream.matchesTailer(t) {
+			stream.addTailer(t)
+		}
+	}
+	i.tailerMtx.RUnlock()
+
+	if len(closedTailers) != 0 {
+		i.tailerMtx.Lock()
+		defer i.tailerMtx.Unlock()
+		for _, closedTailer := range closedTailers {
+			delete(i.tailers, closedTailer)
+		}
+	}
+}
+
+func (i *instance) closeTailers() {
+	i.tailerMtx.Lock()
+	defer i.tailerMtx.Unlock()
+	for _, t := range i.tailers {
+		t.close()
+	}
 }
 
 func isDone(ctx context.Context) bool {

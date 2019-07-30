@@ -16,7 +16,7 @@ $ go get github.com/grafana/loki/cmd/logcli
 
 ```
 $ go get github.com/grafana/loki
-$ cd $GOPATH/github.com/grafana/loki
+$ cd $GOPATH/src/github.com/grafana/loki
 $ go build ./cmd/logcli
 ```
 
@@ -44,8 +44,8 @@ Common labels: {job="cortex-ops/consul", namespace="cortex-ops"}
 
 ### Configuration
 
-
 Configuration values are considered in the following order (lowest to highest):
+
 - environment value
 - command line
 
@@ -53,17 +53,24 @@ The URLs of the requests are printed to help with integration work.
 
 ### Details
 
-```
+```console
 $ logcli help
 usage: logcli [<flags>] <command> [<args> ...]
 
 A command-line for loki.
 
 Flags:
-  --help         Show context-sensitive help (also try --help-long and --help-man).
-  --addr=""      Server address, need to specify.
-  --username=""  Username for HTTP basic auth.
-  --password=""  Password for HTTP basic auth.
+      --help             Show context-sensitive help (also try --help-long and --help-man).
+  -q, --quiet            suppress everything but log lines
+  -o, --output=default   specify output mode [default, raw, jsonl]
+      --addr="https://logs-us-west1.grafana.net"  
+                         Server address.
+      --username=""      Username for HTTP basic auth.
+      --password=""      Password for HTTP basic auth.
+      --ca-cert=""       Path to the server Certificate Authority.
+      --tls-skip-verify  Server certificate TLS skip verify.
+      --cert=""          Path to the client certificate.
+      --key=""           Path to the client certificate key.
 
 Commands:
   help [<command>...]
@@ -72,7 +79,7 @@ Commands:
   query [<flags>] <query> [<regex>]
     Run a LogQL query.
 
-  labels <label>
+  labels [<label>]
     Find values for a given label.
 
 $ logcli help query
@@ -81,15 +88,30 @@ usage: logcli query [<flags>] <query> [<regex>]
 Run a LogQL query.
 
 Flags:
-  --help         Show context-sensitive help (also try --help-long and --help-man).
-  --addr=""      Server address, need to specify.
-  --username=""  Username for HTTP basic auth.
-  --password=""  Password for HTTP basic auth.
-  --limit=30     Limit on number of entries to print.
-  --since=1h     Lookback window.
-  --forward      Scan forwards through logs.
-  -t, --tail     Tail the logs
-  --no-labels    Do not print labels
+      --help             Show context-sensitive help (also try --help-long and --help-man).
+  -q, --quiet            suppress everything but log lines
+  -o, --output=default   specify output mode [default, raw, jsonl]
+      --addr="https://logs-us-west1.grafana.net"  
+                         Server address.
+      --username=""      Username for HTTP basic auth.
+      --password=""      Password for HTTP basic auth.
+      --ca-cert=""       Path to the server Certificate Authority.
+      --tls-skip-verify  Server certificate TLS skip verify.
+      --cert=""          Path to the client certificate.
+      --key=""           Path to the client certificate key.
+      --limit=30         Limit on number of entries to print.
+      --since=1h         Lookback window.
+      --from=FROM        Start looking for logs at this absolute time (inclusive)
+      --to=TO            Stop looking for logs at this absolute time (exclusive)
+      --forward          Scan forwards through logs.
+  -t, --tail             Tail the logs
+      --delay-for=0      Delay in tailing by number of seconds to accumulate logs for re-ordering
+      --no-labels        Do not print any labels
+      --exclude-label=EXCLUDE-LABEL ...  
+                         Exclude labels given the provided key during output.
+      --include-label=INCLUDE-LABEL ...  
+                         Include labels given the provided key during output.
+      --labels-length=0  Set a fixed padding to labels
 
 Args:
   <query>    eg '{foo="bar",baz="blip"}'

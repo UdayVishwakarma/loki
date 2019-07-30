@@ -5,7 +5,7 @@ APIKEY="${2:-}"
 INSTANCEURL="${3:-}"
 NAMESPACE="${4:-default}"
 CONTAINERROOT="${5:-/var/lib/docker}"
-PARSER="${6:-docker}"
+PARSER="${6:-- docker:}"
 
 if [ -z "$INSTANCEID" -o -z "$APIKEY" -o -z "$INSTANCEURL" -o -z "$NAMESPACE" -o -z "$CONTAINERROOT" -o -z "$PARSER" ]; then
     echo "usage: $0 <instanceId> <apiKey> <url> [<namespace>[<container_root_path>[<parser>]]]"
@@ -17,7 +17,8 @@ apiVersion: v1
 data:
   promtail.yml: |
     scrape_configs:
-    - entry_parser: <parser>
+    - pipeline_stages:
+      <parser>
       job_name: kubernetes-pods-name
       kubernetes_sd_configs:
       - role: pod
@@ -53,13 +54,14 @@ data:
         target_label: container_name
       - action: labelmap
         regex: __meta_kubernetes_pod_label_(.+)
-      - replacement: /var/log/pods/$1/*.log
+      - replacement: /var/log/pods/*$1/*.log
         separator: /
         source_labels:
         - __meta_kubernetes_pod_uid
         - __meta_kubernetes_pod_container_name
         target_label: __path__
-    - entry_parser: <parser>
+    - pipeline_stages:
+      <parser>
       job_name: kubernetes-pods-app
       kubernetes_sd_configs:
       - role: pod
@@ -99,13 +101,14 @@ data:
         target_label: container_name
       - action: labelmap
         regex: __meta_kubernetes_pod_label_(.+)
-      - replacement: /var/log/pods/$1/*.log
+      - replacement: /var/log/pods/*$1/*.log
         separator: /
         source_labels:
         - __meta_kubernetes_pod_uid
         - __meta_kubernetes_pod_container_name
         target_label: __path__
-    - entry_parser: <parser>
+    - pipeline_stages:
+      <parser>
       job_name: kubernetes-pods-direct-controllers
       kubernetes_sd_configs:
       - role: pod
@@ -151,13 +154,14 @@ data:
         target_label: container_name
       - action: labelmap
         regex: __meta_kubernetes_pod_label_(.+)
-      - replacement: /var/log/pods/$1/*.log
+      - replacement: /var/log/pods/*$1/*.log
         separator: /
         source_labels:
         - __meta_kubernetes_pod_uid
         - __meta_kubernetes_pod_container_name
         target_label: __path__
-    - entry_parser: <parser>
+    - pipeline_stages:
+      <parser>
       job_name: kubernetes-pods-indirect-controller
       kubernetes_sd_configs:
       - role: pod
@@ -205,12 +209,61 @@ data:
         target_label: container_name
       - action: labelmap
         regex: __meta_kubernetes_pod_label_(.+)
-      - replacement: /var/log/pods/$1/*.log
+      - replacement: /var/log/pods/*$1/*.log
         separator: /
         source_labels:
         - __meta_kubernetes_pod_uid
         - __meta_kubernetes_pod_container_name
         target_label: __path__
+    - pipeline_stages:
+      <parser>
+      job_name: kubernetes-pods-static
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - action: drop
+        regex: ^$
+        source_labels:
+        - __meta_kubernetes_pod_annotation_kubernetes_io_config_mirror
+      - action: replace
+        source_labels:
+        - __meta_kubernetes_pod_label_component
+        target_label: __service__
+      - source_labels:
+        - __meta_kubernetes_pod_node_name
+        target_label: __host__
+      - action: drop
+        regex: ^$
+        source_labels:
+        - __service__
+      - action: replace
+        replacement: $1
+        separator: /
+        source_labels:
+        - __meta_kubernetes_namespace
+        - __service__
+        target_label: job
+      - action: replace
+        source_labels:
+        - __meta_kubernetes_namespace
+        target_label: namespace
+      - action: replace
+        source_labels:
+        - __meta_kubernetes_pod_name
+        target_label: instance
+      - action: replace
+        source_labels:
+        - __meta_kubernetes_pod_container_name
+        target_label: container_name
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - replacement: /var/log/pods/*$1/*.log
+        separator: /
+        source_labels:
+        - __meta_kubernetes_pod_annotation_kubernetes_io_config_mirror
+        - __meta_kubernetes_pod_container_name
+        target_label: __path__
+
 kind: ConfigMap
 metadata:
   name: promtail
@@ -221,6 +274,9 @@ metadata:
   name: promtail
 spec:
   minReadySeconds: 10
+  selector:
+    matchLabels:
+      name: promtail
   template:
     metadata:
       labels:

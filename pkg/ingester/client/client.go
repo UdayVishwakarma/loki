@@ -8,7 +8,7 @@ import (
 	cortex_client "github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
-	"github.com/mwitkow/go-grpc-middleware"
+	grpc_middleware "github.com/mwitkow/go-grpc-middleware"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/weaveworks/common/middleware"
 	"google.golang.org/grpc"
@@ -55,11 +55,13 @@ func New(cfg Config, addr string) (grpc_health_v1.HealthClient, error) {
 	return struct {
 		logproto.PusherClient
 		logproto.QuerierClient
+		logproto.IngesterClient
 		grpc_health_v1.HealthClient
 		io.Closer
 	}{
-		PusherClient:  logproto.NewPusherClient(conn),
-		QuerierClient: logproto.NewQuerierClient(conn),
-		Closer:        conn,
+		PusherClient:   logproto.NewPusherClient(conn),
+		QuerierClient:  logproto.NewQuerierClient(conn),
+		IngesterClient: logproto.NewIngesterClient(conn),
+		Closer:         conn,
 	}, nil
 }

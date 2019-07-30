@@ -2,11 +2,13 @@ package ingester
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/user"
@@ -15,8 +17,15 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
 )
+
+// ErrReadOnly is returned when the ingester is shutting down and a push was
+// attempted.
+var ErrReadOnly = errors.New("Ingester is shutting down")
+
+var readinessProbeSuccess = []byte("Ready")
 
 var flushQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "cortex_ingester_flush_queue_length",
@@ -27,36 +36,48 @@ var flushQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
 type Config struct {
 	LifecyclerConfig ring.LifecyclerConfig `yaml:"lifecycler,omitempty"`
 
+	// Config for transferring chunks.
+	MaxTransferRetries int `yaml:"max_transfer_retries,omitempty"`
+
 	ConcurrentFlushes int           `yaml:"concurrent_flushes"`
 	FlushCheckPeriod  time.Duration `yaml:"flush_check_period"`
 	FlushOpTimeout    time.Duration `yaml:"flush_op_timeout"`
 	RetainPeriod      time.Duration `yaml:"chunk_retain_period"`
 	MaxChunkIdle      time.Duration `yaml:"chunk_idle_period"`
+	BlockSize         int           `yaml:"chunk_block_size"`
+
+	// For testing, you can override the address and ID of this ingester.
+	ingesterClientFactory func(cfg client.Config, addr string) (grpc_health_v1.HealthClient, error)
 }
 
 // RegisterFlags registers the flags.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.LifecyclerConfig.RegisterFlags(f)
 
+	f.IntVar(&cfg.MaxTransferRetries, "ingester.max-transfer-retries", 10, "Number of times to try and transfer chunks before falling back to flushing.")
 	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushed", 16, "")
 	f.DurationVar(&cfg.FlushCheckPeriod, "ingester.flush-check-period", 30*time.Second, "")
 	f.DurationVar(&cfg.FlushOpTimeout, "ingester.flush-op-timeout", 10*time.Second, "")
 	f.DurationVar(&cfg.RetainPeriod, "ingester.chunks-retain-period", 15*time.Minute, "")
 	f.DurationVar(&cfg.MaxChunkIdle, "ingester.chunks-idle-period", 30*time.Minute, "")
+	f.IntVar(&cfg.BlockSize, "ingester.chunks-block-size", 256*1024, "")
 }
 
 // Ingester builds chunks for incoming log streams.
 type Ingester struct {
-	cfg Config
+	cfg          Config
+	clientConfig client.Config
 
 	instancesMtx sync.RWMutex
 	instances    map[string]*instance
+	readonly     bool
 
 	lifecycler *ring.Lifecycler
 	store      ChunkStore
 
-	done sync.WaitGroup
-	quit chan struct{}
+	done     sync.WaitGroup
+	quit     chan struct{}
+	quitting chan struct{}
 
 	// One queue per flush thread.  Fingerprint is used to
 	// pick a queue.
@@ -70,13 +91,19 @@ type ChunkStore interface {
 }
 
 // New makes a new Ingester.
-func New(cfg Config, store ChunkStore) (*Ingester, error) {
+func New(cfg Config, clientConfig client.Config, store ChunkStore) (*Ingester, error) {
+	if cfg.ingesterClientFactory == nil {
+		cfg.ingesterClientFactory = client.New
+	}
+
 	i := &Ingester{
-		cfg:         cfg,
-		instances:   map[string]*instance{},
-		store:       store,
-		quit:        make(chan struct{}),
-		flushQueues: make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
+		cfg:          cfg,
+		clientConfig: clientConfig,
+		instances:    map[string]*instance{},
+		store:        store,
+		quit:         make(chan struct{}),
+		flushQueues:  make([]*util.PriorityQueue, cfg.ConcurrentFlushes),
+		quitting:     make(chan struct{}),
 	}
 
 	i.flushQueuesDone.Add(cfg.ConcurrentFlushes)
@@ -86,7 +113,7 @@ func New(cfg Config, store ChunkStore) (*Ingester, error) {
 	}
 
 	var err error
-	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i)
+	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester")
 	if err != nil {
 		return nil, err
 	}
@@ -122,14 +149,12 @@ func (i *Ingester) Shutdown() {
 	i.lifecycler.Shutdown()
 }
 
-// StopIncomingRequests implements ring.Lifecycler.
-func (i *Ingester) StopIncomingRequests() {
-
-}
-
-// TransferOut implements ring.Lifecycler.
-func (i *Ingester) TransferOut(context.Context) error {
-	return nil
+// Stopping helps cleaning up resources before actual shutdown
+func (i *Ingester) Stopping() {
+	close(i.quitting)
+	for _, instance := range i.getInstances() {
+		instance.closeTailers()
+	}
 }
 
 // Push implements logproto.Pusher.
@@ -137,6 +162,8 @@ func (i *Ingester) Push(ctx context.Context, req *logproto.PushRequest) (*logpro
 	instanceID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, err
+	} else if i.readonly {
+		return nil, ErrReadOnly
 	}
 
 	instance := i.getOrCreateInstance(instanceID)
@@ -154,7 +181,7 @@ func (i *Ingester) getOrCreateInstance(instanceID string) *instance {
 	defer i.instancesMtx.Unlock()
 	inst, ok = i.instances[instanceID]
 	if !ok {
-		inst = newInstance(instanceID)
+		inst = newInstance(instanceID, i.cfg.BlockSize)
 		i.instances[instanceID] = inst
 	}
 	return inst
@@ -193,13 +220,17 @@ func (*Ingester) Watch(*grpc_health_v1.HealthCheckRequest, grpc_health_v1.Health
 }
 
 // ReadinessHandler is used to indicate to k8s when the ingesters are ready for
-// the addition removal of another ingester. Returns 204 when the ingester is
+// the addition removal of another ingester. Returns 200 when the ingester is
 // ready, 500 otherwise.
 func (i *Ingester) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
-	if err := i.lifecycler.CheckReady(r.Context()); err == nil {
-		w.WriteHeader(http.StatusNoContent)
-	} else {
-		w.WriteHeader(http.StatusInternalServerError)
+	if err := i.lifecycler.CheckReady(r.Context()); err != nil {
+		http.Error(w, "Not ready: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(readinessProbeSuccess); err != nil {
+		level.Error(util.Logger).Log("msg", "error writing success message", "error", err)
 	}
 }
 
@@ -220,4 +251,28 @@ func (i *Ingester) getInstances() []*instance {
 		instances = append(instances, instance)
 	}
 	return instances
+}
+
+// Tail logs matching given query
+func (i *Ingester) Tail(req *logproto.TailRequest, queryServer logproto.Querier_TailServer) error {
+	select {
+	case <-i.quitting:
+		return errors.New("Ingester is stopping")
+	default:
+	}
+
+	instanceID, err := user.ExtractOrgID(queryServer.Context())
+	if err != nil {
+		return err
+	}
+
+	instance := i.getOrCreateInstance(instanceID)
+	tailer, err := newTailer(instanceID, req.Query, req.Regex, queryServer)
+	if err != nil {
+		return err
+	}
+
+	instance.addNewTailer(tailer)
+	tailer.loop()
+	return nil
 }

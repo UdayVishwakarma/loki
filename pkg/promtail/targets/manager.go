@@ -12,6 +12,8 @@ import (
 type targetManager interface {
 	Ready() bool
 	Stop()
+	ActiveTargets() map[string][]Target
+	AllTargets() map[string][]Target
 }
 
 // TargetManagers manages a list of target managers.
@@ -29,26 +31,72 @@ func NewTargetManagers(
 ) (*TargetManagers, error) {
 	var targetManagers []targetManager
 	var fileScrapeConfigs []scrape.Config
+	var journalScrapeConfigs []scrape.Config
 
-	// for now every scrape config is a file target
-	fileScrapeConfigs = append(fileScrapeConfigs, scrapeConfigs...)
-	fileTargetManager, err := NewFileTargetManager(
-		logger,
-		positions,
-		client,
-		fileScrapeConfigs,
-		targetConfig,
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to make file target manager")
+	for _, cfg := range scrapeConfigs {
+		if cfg.HasServiceDiscoveryConfig() {
+			fileScrapeConfigs = append(fileScrapeConfigs, cfg)
+		}
 	}
-	targetManagers = append(targetManagers, fileTargetManager)
+	if len(fileScrapeConfigs) > 0 {
+		fileTargetManager, err := NewFileTargetManager(
+			logger,
+			positions,
+			client,
+			fileScrapeConfigs,
+			targetConfig,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to make file target manager")
+		}
+		targetManagers = append(targetManagers, fileTargetManager)
+	}
+
+	for _, cfg := range scrapeConfigs {
+		if cfg.JournalConfig != nil {
+			journalScrapeConfigs = append(journalScrapeConfigs, cfg)
+		}
+	}
+	if len(journalScrapeConfigs) > 0 {
+		journalTargetManager, err := NewJournalTargetManager(
+			logger,
+			positions,
+			client,
+			journalScrapeConfigs,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to make journal target manager")
+		}
+		targetManagers = append(targetManagers, journalTargetManager)
+	}
 
 	return &TargetManagers{targetManagers: targetManagers}, nil
 
 }
 
-// Ready if there's at least one ready FileTargetManager
+// ActiveTargets returns active targets per jobs
+func (tm *TargetManagers) ActiveTargets() map[string][]Target {
+	result := map[string][]Target{}
+	for _, t := range tm.targetManagers {
+		for job, targets := range t.ActiveTargets() {
+			result[job] = append(result[job], targets...)
+		}
+	}
+	return result
+}
+
+// AllTargets returns all targets per jobs
+func (tm *TargetManagers) AllTargets() map[string][]Target {
+	result := map[string][]Target{}
+	for _, t := range tm.targetManagers {
+		for job, targets := range t.AllTargets() {
+			result[job] = append(result[job], targets...)
+		}
+	}
+	return result
+}
+
+// Ready if there's at least one ready target manager.
 func (tm *TargetManagers) Ready() bool {
 	for _, t := range tm.targetManagers {
 		if t.Ready() {
